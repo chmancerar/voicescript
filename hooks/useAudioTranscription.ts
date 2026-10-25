@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { TranscriptionMode, AppState } from '../types';
+import { TranscriptionMode, AppState, LoadingStep, TranscriptCache } from '../types';
 import {
   MAX_FILE_SIZE_BYTES,
   formatBytes,
@@ -15,11 +15,19 @@ import {
   clearApiKeyFromStorage
 } from '../services/geminiService';
 
+const EMPTY_CACHE: TranscriptCache = {
+  standard: null,
+  subtitles: null,
+  clean: null,
+};
+
 export const useAudioTranscription = () => {
   const [currentFile, setCurrentFile] = useState<File | null>(null);
   const [appState, setAppState] = useState<AppState>('IDLE');
+  const [loadingStep, setLoadingStep] = useState<LoadingStep>('transcribing');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [transcriptionText, setTranscriptionText] = useState<string | null>(null);
+  const [transcriptCache, setTranscriptCache] = useState<TranscriptCache>(EMPTY_CACHE);
   const [apiKeyAvailable, setApiKeyAvailable] = useState<boolean>(true);
   const [audioSrc, setAudioSrc] = useState<string | null>(null);
 
@@ -30,8 +38,10 @@ export const useAudioTranscription = () => {
   const [audioCefrLevel, setAudioCefrLevel] = useState<string | null>(null);
   const [audioCefrExplanation, setAudioCefrExplanation] = useState<string | null>(null);
   const [audioDurationFormatted, setAudioDurationFormatted] = useState<string | null>(null);
+  const [audioDurationSeconds, setAudioDurationSeconds] = useState<number | null>(null);
 
   const audioRef = useRef<HTMLAudioElement>(null);
+  const requestIdRef = useRef<number>(0);
 
   // Check API key availability on mount and when changed
   const checkApiKey = useCallback(() => {
@@ -80,6 +90,7 @@ export const useAudioTranscription = () => {
 
   const handleAudioLoadedMetadata = useCallback((duration: number) => {
     if (!isNaN(duration) && duration > 0 && duration !== Infinity) {
+      setAudioDurationSeconds(duration);
       setAudioDurationFormatted(formatDuration(duration));
     }
   }, []);
@@ -89,10 +100,15 @@ export const useAudioTranscription = () => {
     setAudioCefrLevel(null);
     setAudioCefrExplanation(null);
     setAudioDurationFormatted(null);
+    setAudioDurationSeconds(null);
     setAudioCurrentTime(0);
+    setTranscriptCache(EMPTY_CACHE);
   };
 
   const handleClearFile = useCallback(() => {
+    // Invalidate any in-flight requests
+    requestIdRef.current += 1;
+
     if (audioSrc) {
       URL.revokeObjectURL(audioSrc);
       setAudioSrc(null);
@@ -109,6 +125,9 @@ export const useAudioTranscription = () => {
   }, [audioSrc]);
 
   const handleFileSelect = useCallback((file: File | null) => {
+    // Invalidate any in-flight requests
+    requestIdRef.current += 1;
+
     if (audioSrc) {
       URL.revokeObjectURL(audioSrc);
       setAudioSrc(null);
@@ -152,6 +171,7 @@ export const useAudioTranscription = () => {
       audioProbe.src = newAudioSrc;
       audioProbe.onloadedmetadata = () => {
         if (!isNaN(audioProbe.duration) && audioProbe.duration > 0 && audioProbe.duration !== Infinity) {
+          setAudioDurationSeconds(audioProbe.duration);
           setAudioDurationFormatted(formatDuration(audioProbe.duration));
         }
       };
@@ -167,7 +187,27 @@ export const useAudioTranscription = () => {
     }
   }, []);
 
-  const handleTranscribe = async (modeOverride?: TranscriptionMode) => {
+  const handleCancelTranscription = useCallback(() => {
+    requestIdRef.current += 1;
+    setErrorMessage(null);
+
+    // If we already have a cached transcript for another mode, restore it
+    const existingMode = (['standard', 'subtitles', 'clean'] as TranscriptionMode[]).find(
+      (m) => Boolean(transcriptCache[m])
+    );
+    if (existingMode && transcriptCache[existingMode]) {
+      setTranscriptionMode(existingMode);
+      setTranscriptionText(transcriptCache[existingMode]);
+      setAppState('TRANSCRIBED');
+    } else if (currentFile) {
+      setTranscriptionText(null);
+      setAppState('FILE_SELECTED');
+    } else {
+      setAppState('IDLE');
+    }
+  }, [transcriptCache, currentFile]);
+
+  const handleTranscribe = async (modeOverride?: TranscriptionMode, forceRefresh = false) => {
     const activeMode = modeOverride || transcriptionMode;
     if (modeOverride) {
       setTranscriptionMode(modeOverride);
@@ -179,6 +219,13 @@ export const useAudioTranscription = () => {
       return;
     }
 
+    // Check cache first unless forced
+    if (!forceRefresh && transcriptCache[activeMode]) {
+      setTranscriptionText(transcriptCache[activeMode]);
+      setAppState('TRANSCRIBED');
+      return;
+    }
+
     if (!getActiveApiKey()) {
       setApiKeyAvailable(false);
       setAppState('API_KEY_MISSING');
@@ -186,42 +233,65 @@ export const useAudioTranscription = () => {
       return;
     }
 
+    const reqId = ++requestIdRef.current;
+
     setAppState('LOADING');
+    setLoadingStep('transcribing');
     setErrorMessage(null);
     setTranscriptionText("");
-    setAudioSummary(null);
-    setAudioCefrLevel(null);
-    setAudioCefrExplanation(null);
-    setAudioCurrentTime(0);
 
     try {
       const text = await transcribeAudioWithGemini(
         currentFile,
         activeMode,
         (_chunk, fullText) => {
-          setTranscriptionText(fullText);
-        }
+          if (requestIdRef.current === reqId) {
+            setTranscriptionText(fullText);
+          }
+        },
+        undefined,
+        audioDurationSeconds
       );
-      setTranscriptionText(text);
 
-      if (text && text.trim() !== "") {
-        try {
-          const analysisResult = await analyzeAudioContent(text);
-          setAudioSummary(analysisResult.summary);
-          setAudioCefrLevel(analysisResult.cefrLevel);
-          setAudioCefrExplanation(analysisResult.cefrExplanation || null);
-        } catch (analysisError: any) {
-          console.error("Audio content analysis failed:", analysisError);
-          setAudioSummary("Could not retrieve summary.");
+      if (requestIdRef.current !== reqId) return;
+
+      setTranscriptionText(text);
+      setTranscriptCache((prev) => ({
+        ...prev,
+        [activeMode]: text,
+      }));
+
+      // Only run audio summary & CEFR analysis if not already computed for this file
+      const hasExistingAnalysis = Boolean(audioSummary && audioCefrLevel && audioCefrLevel !== 'N/A');
+
+      if (!hasExistingAnalysis) {
+        if (text && text.trim() !== "") {
+          setLoadingStep('analyzing');
+          try {
+            const analysisResult = await analyzeAudioContent(text);
+            if (requestIdRef.current !== reqId) return;
+            setAudioSummary(analysisResult.summary);
+            setAudioCefrLevel(analysisResult.cefrLevel);
+            setAudioCefrExplanation(analysisResult.cefrExplanation || null);
+          } catch (analysisError: any) {
+            if (requestIdRef.current !== reqId) return;
+            console.error("Audio content analysis failed:", analysisError);
+            setAudioSummary("Could not retrieve summary.");
+            setAudioCefrLevel("N/A");
+            setAudioCefrExplanation(null);
+          }
+        } else {
+          setAudioSummary("Transcription was empty, no analysis performed.");
           setAudioCefrLevel("N/A");
-          setAudioCefrExplanation(null);
         }
-      } else {
-        setAudioSummary("Transcription was empty, no analysis performed.");
-        setAudioCefrLevel("N/A");
       }
-      setAppState('TRANSCRIBED');
+
+      if (requestIdRef.current === reqId) {
+        setAppState('TRANSCRIBED');
+      }
     } catch (error: any) {
+      if (requestIdRef.current !== reqId) return;
+
       console.error("Transcription error in hook:", error);
       if (error.message === "API_KEY_MISSING") {
         setApiKeyAvailable(false);
@@ -231,13 +301,12 @@ export const useAudioTranscription = () => {
         setErrorMessage(error.message || "An unknown error occurred during transcription.");
         setAppState('ERROR');
       }
-      // Note: We deliberately PRESERVE currentFile and audioSrc so user can retry without re-uploading
     }
   };
 
   const handleRetry = () => {
     if (currentFile) {
-      handleTranscribe();
+      handleTranscribe(transcriptionMode, true);
     } else {
       handleClearFile();
     }
@@ -245,9 +314,11 @@ export const useAudioTranscription = () => {
 
   return {
     appState,
+    loadingStep,
     currentFile,
     errorMessage,
     transcriptionText,
+    transcriptCache,
     apiKeyAvailable,
     audioSrc,
     transcriptionMode,
@@ -258,12 +329,14 @@ export const useAudioTranscription = () => {
     audioCefrLevel,
     audioCefrExplanation,
     audioDurationFormatted,
+    audioDurationSeconds,
     audioRef,
     handleAudioLoadedMetadata,
     handleFileSelect,
     handleClearFile,
     handleSeek,
     handleTranscribe,
+    handleCancelTranscription,
     handleRetry,
     handleSaveApiKey,
     handleRemoveApiKey,

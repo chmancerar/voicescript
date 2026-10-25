@@ -4,6 +4,10 @@ export type TranscriptionMode = 'standard' | 'subtitles' | 'clean';
 
 export type AppState = 'IDLE' | 'API_KEY_MISSING' | 'FILE_SELECTED' | 'LOADING' | 'TRANSCRIBED' | 'ERROR';
 
+export type LoadingStep = 'transcribing' | 'analyzing';
+
+export type TranscriptCache = Record<TranscriptionMode, string | null>;
+
 export interface AudioAnalysisResult {
   summary: string;
   cefrLevel: string;

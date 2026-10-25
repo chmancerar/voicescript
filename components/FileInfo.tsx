@@ -1,40 +1,61 @@
-
 import React from 'react';
-import { FileAudio, XCircle } from 'lucide-react';
+import { FileAudio, X, Clock, HardDrive } from 'lucide-react';
+import { formatBytes } from '../constants';
 
 interface FileInfoProps {
   fileName: string;
   fileSize: number;
+  durationFormatted?: string | null;
   onClear: () => void;
+  disabled?: boolean;
 }
 
-export const FileInfo = ({ fileName, fileSize, onClear }: FileInfoProps) => { // Removed React.FC, typed props
-  const formatFileSize = (bytes: number): string => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
-
+export const FileInfo: React.FC<FileInfoProps> = ({
+  fileName,
+  fileSize,
+  durationFormatted,
+  onClear,
+  disabled = false,
+}) => {
   return (
-    <div className="mt-2 mb-6 p-4 bg-slate-700 rounded-lg shadow flex items-center justify-between">
-      <div className="flex items-center space-x-3">
-        <FileAudio className="w-8 h-8 text-sky-400 flex-shrink-0" />
-        <div>
-          <p className="text-sm font-medium text-slate-100 truncate max-w-xs sm:max-w-sm md:max-w-md" title={fileName}>
+    <div className="my-3 p-3.5 sm:p-4 bg-slate-900/80 border border-slate-700/70 rounded-2xl shadow-lg flex items-center justify-between gap-3">
+      <div className="flex items-center gap-3.5 min-w-0">
+        <div className="p-2.5 rounded-xl bg-sky-500/15 border border-sky-500/30 text-sky-400 flex-shrink-0">
+          <FileAudio className="w-6 h-6" />
+        </div>
+        <div className="min-w-0">
+          <p
+            className="text-sm font-semibold text-slate-100 truncate max-w-[220px] sm:max-w-md"
+            title={fileName}
+          >
             {fileName}
           </p>
-          <p className="text-xs text-slate-400">{formatFileSize(fileSize)}</p>
+          <div className="flex items-center gap-3 mt-1 text-xs text-slate-400 font-mono">
+            <span className="inline-flex items-center gap-1">
+              <HardDrive size={12} className="text-slate-500" />
+              {formatBytes(fileSize)}
+            </span>
+            {durationFormatted && (
+              <span className="inline-flex items-center gap-1 text-sky-300">
+                <Clock size={12} className="text-sky-400" />
+                {durationFormatted}
+              </span>
+            )}
+          </div>
         </div>
       </div>
-      <button
-        onClick={onClear}
-        title="Clear selection"
-        className="p-1.5 text-slate-400 hover:text-red-400 transition-colors rounded-full hover:bg-slate-600"
-      >
-        <XCircle size={22} />
-      </button>
+
+      {!disabled && (
+        <button
+          type="button"
+          onClick={onClear}
+          title="Remove audio file"
+          aria-label="Remove audio file"
+          className="p-2 text-slate-400 hover:text-rose-400 transition-colors rounded-xl hover:bg-slate-800 border border-transparent hover:border-slate-700 cursor-pointer flex-shrink-0"
+        >
+          <X size={18} />
+        </button>
+      )}
     </div>
   );
 };

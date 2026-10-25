@@ -1,9 +1,208 @@
 import { GoogleGenAI, GenerateContentResponse, Part, Type } from "@google/genai";
-import { resolveAudioMimeType, isAudioFileSupported } from '../constants';
+import { resolveAudioMimeType, isAudioFileSupported, parseTimestampToSeconds } from '../constants';
 import { TranscriptionMode, AudioAnalysisResult } from '../types';
-import { PROMPTS } from './prompts';
+import { PROMPTS, buildTranscriptionPrompt } from './prompts';
 
 export const API_KEY_STORAGE_KEY = 'VOICESCRIPT_GEMINI_API_KEY';
+
+/**
+ * Formats seconds into SubRip (SRT) timestamp: HH:MM:SS,mmm
+ */
+function formatSecondsToSrtTime(totalSeconds: number): string {
+  const safeSecs = Math.max(0, totalSeconds);
+  const totalMs = Math.round(safeSecs * 1000);
+  const hours = Math.floor(totalMs / 3600000);
+  const mins = Math.floor((totalMs % 3600000) / 60000);
+  const secs = Math.floor((totalMs % 60000) / 1000);
+  const ms = totalMs % 1000;
+
+  return `${hours.toString().padStart(2, '0')}:${mins
+    .toString()
+    .padStart(2, '0')}:${secs.toString().padStart(2, '0')},${ms
+    .toString()
+    .padStart(3, '0')}`;
+}
+
+/**
+ * Wraps a subtitle cue string into at most 2 balanced lines (<= 42 chars per line where possible).
+ */
+function wrapSubtitleCueText(text: string, maxLineLength = 42): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (clean.length <= maxLineLength) return clean;
+
+  // Find the space closest to the midpoint
+  const mid = Math.floor(clean.length / 2);
+  let bestSplit = -1;
+  let minDistance = Infinity;
+
+  for (let i = 0; i < clean.length; i++) {
+    if (clean[i] === ' ') {
+      const dist = Math.abs(i - mid);
+      if (dist < minDistance) {
+        minDistance = dist;
+        bestSplit = i;
+      }
+    }
+  }
+
+  if (bestSplit > 0) {
+    return `${clean.slice(0, bestSplit).trim()}\n${clean.slice(bestSplit + 1).trim()}`;
+  }
+  return clean;
+}
+
+/**
+ * Splits a long spoken utterance (> 84 chars) into subtitle-sized clauses (<= 84 chars each).
+ */
+function splitLongUtteranceIntoCueTexts(text: string, maxCueChars = 84): string[] {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+  if (clean.length <= maxCueChars) return [clean];
+
+  const words = clean.split(' ');
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const word of words) {
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length > maxCueChars && current) {
+      chunks.push(current);
+      current = word;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) {
+    chunks.push(current);
+  }
+  return chunks;
+}
+
+/**
+ * Converts [MM:SS] audio-clock-grounded lines from Gemini into strict SubRip (.srt) format.
+ * Because Gemini's native audio encoder grounds [MM:SS] timestamps directly to audio frames,
+ * this prevents cumulative subtitle drift while producing broadcast-compliant SRT cues.
+ */
+export function convertTimestampedLinesToSrt(
+  rawText: string,
+  audioDurationSeconds?: number | null
+): string {
+  const trimmed = rawText.trim();
+  if (!trimmed) return '';
+
+  // If the text is already formatted with SRT "-->" arrows, return as-is
+  if (/\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/.test(trimmed)) {
+    return trimmed;
+  }
+
+  const rawLines = trimmed.split('\n');
+  const anchorGroups: { startTime: number; cueTexts: string[] }[] = [];
+
+  const lineRegex =
+    /^(?:(\[\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*\]|\(\s*\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d{1,3})?\s*\))\s*)?(?:(?:Speaker|Hablante|Interlocuteur|Person)\s*\w*:\s*)?(.*)/i;
+
+  for (const rawLine of rawLines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    const match = line.match(lineRegex);
+    if (!match) continue;
+
+    const rawTs = match[1];
+    const content = (match[2] || '').trim();
+    if (!content) continue;
+
+    const cueParts = splitLongUtteranceIntoCueTexts(content, 84);
+    if (cueParts.length === 0) continue;
+
+    if (rawTs) {
+      const startSec = parseTimestampToSeconds(rawTs);
+      const lastGroup = anchorGroups[anchorGroups.length - 1];
+      if (lastGroup && Math.abs(lastGroup.startTime - startSec) < 0.05) {
+        lastGroup.cueTexts.push(...cueParts);
+      } else {
+        // Ensure monotonic start times
+        const safeStart =
+          lastGroup && startSec < lastGroup.startTime ? lastGroup.startTime + 0.5 : startSec;
+        anchorGroups.push({ startTime: safeStart, cueTexts: [...cueParts] });
+      }
+    } else if (anchorGroups.length > 0) {
+      anchorGroups[anchorGroups.length - 1].cueTexts.push(...cueParts);
+    } else {
+      anchorGroups.push({ startTime: 0, cueTexts: [...cueParts] });
+    }
+  }
+
+  if (anchorGroups.length === 0) {
+    return trimmed;
+  }
+
+  const srtBlocks: string[] = [];
+  let sequenceNum = 1;
+
+  for (let gIdx = 0; gIdx < anchorGroups.length; gIdx++) {
+    const group = anchorGroups[gIdx];
+    const nextGroup = anchorGroups[gIdx + 1];
+
+    const groupStart = group.startTime;
+    const totalWords = group.cueTexts
+      .join(' ')
+      .split(/\s+/)
+      .filter(Boolean).length;
+
+    // Natural speaking duration estimate (~0.43s per word + 0.6s phrase resonance)
+    const estimatedSpeechDuration = Math.max(
+      1.4 * group.cueTexts.length,
+      totalWords * 0.43 + 0.6
+    );
+
+    let maxWindowEnd: number;
+    if (nextGroup) {
+      maxWindowEnd = Math.max(groupStart + 0.4, nextGroup.startTime - 0.06);
+    } else if (
+      typeof audioDurationSeconds === 'number' &&
+      !isNaN(audioDurationSeconds) &&
+      audioDurationSeconds > groupStart
+    ) {
+      maxWindowEnd = audioDurationSeconds;
+    } else {
+      maxWindowEnd = groupStart + estimatedSpeechDuration;
+    }
+
+    const availableWindow = Math.max(0.4, maxWindowEnd - groupStart);
+    const activeGroupDuration = Math.min(availableWindow, estimatedSpeechDuration);
+
+    // Distribute activeGroupDuration across cues in this group proportionally by character length
+    const totalChars = group.cueTexts.reduce((acc, t) => acc + Math.max(1, t.length), 0);
+    let cursorTime = groupStart;
+
+    for (let cIdx = 0; cIdx < group.cueTexts.length; cIdx++) {
+      const cueText = group.cueTexts[cIdx];
+      const weight = Math.max(1, cueText.length) / totalChars;
+      const rawSlice = activeGroupDuration * weight;
+      const isLastInGroup = cIdx === group.cueTexts.length - 1;
+
+      const cueStart = cursorTime;
+      const interCueGap = isLastInGroup ? 0 : Math.min(0.05, rawSlice * 0.08);
+      const cueEnd = Math.max(
+        cueStart + 0.25,
+        Math.min(maxWindowEnd, cueStart + rawSlice - interCueGap)
+      );
+
+      const formattedLines = wrapSubtitleCueText(cueText, 42);
+      srtBlocks.push(
+        `${sequenceNum}\n${formatSecondsToSrtTime(cueStart)} --> ${formatSecondsToSrtTime(
+          cueEnd
+        )}\n${formattedLines}`
+      );
+
+      sequenceNum++;
+      cursorTime = cueEnd + interCueGap;
+    }
+  }
+
+  return srtBlocks.join('\n\n');
+}
 
 /**
  * Retrieves the currently active Gemini API key from explicit parameter,
@@ -100,13 +299,16 @@ export async function transcribeAudioWithGemini(
   audioFile: File,
   mode: TranscriptionMode = 'standard',
   onChunk?: (chunk: string, currentFullText: string) => void,
-  customApiKey?: string | null
+  customApiKey?: string | null,
+  audioDurationSeconds?: number | null
 ): Promise<string> {
   try {
     const client = getAiClient(customApiKey);
     const audioPart = await fileToGenerativePart(audioFile);
 
-    const promptText = PROMPTS.transcription[mode];
+    const promptText = buildTranscriptionPrompt(mode, {
+      durationSeconds: audioDurationSeconds,
+    });
     const textPromptPart: Part = { text: promptText };
     const contents = { parts: [audioPart, textPromptPart] };
 
@@ -124,7 +326,11 @@ export async function transcribeAudioWithGemini(
       for await (const chunk of responseStream) {
         if (chunk.text) {
           accumulatedText += chunk.text;
-          onChunk?.(chunk.text, accumulatedText);
+          const previewText =
+            mode === 'subtitles'
+              ? convertTimestampedLinesToSrt(accumulatedText, audioDurationSeconds)
+              : accumulatedText;
+          onChunk?.(chunk.text, previewText);
         }
       }
       streamSucceeded = true;
@@ -140,9 +346,6 @@ export async function transcribeAudioWithGemini(
         contents,
       });
       accumulatedText = directResponse.text || "";
-      if (accumulatedText && onChunk) {
-        onChunk(accumulatedText, accumulatedText);
-      }
     }
 
     // Strip markdown code fences if model enclosed output in ```srt or ```text
@@ -153,6 +356,14 @@ export async function transcribeAudioWithGemini(
 
     if (!cleanedTranscription || cleanedTranscription === "undefined") {
       throw new Error("The model returned an empty transcription. The audio might be silent, too quiet, or corrupted.");
+    }
+
+    if (mode === 'subtitles') {
+      cleanedTranscription = convertTimestampedLinesToSrt(
+        cleanedTranscription,
+        audioDurationSeconds
+      );
+      onChunk?.('', cleanedTranscription);
     }
 
     return cleanedTranscription;
