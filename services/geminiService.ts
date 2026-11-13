@@ -4,6 +4,20 @@ import { TranscriptionMode, AudioAnalysisResult } from '../types';
 import { PROMPTS, buildTranscriptionPrompt } from './prompts';
 
 export const API_KEY_STORAGE_KEY = 'VOICESCRIPT_GEMINI_API_KEY';
+export const PRIMARY_GEMINI_MODEL = 'gemini-4-hydrogen';
+export const FALLBACK_GEMINI_MODEL = 'gemini-3.8-flash';
+
+function isModelUnavailableError(err: any): boolean {
+  const msg = (err?.message || String(err || '')).toLowerCase();
+  return (
+    msg.includes('not_found') ||
+    msg.includes('not found') ||
+    msg.includes('404') ||
+    msg.includes('not supported') ||
+    msg.includes('invalid model') ||
+    msg.includes('model is not available')
+  );
+}
 
 /**
  * Formats seconds into SubRip (SRT) timestamp: HH:MM:SS,mmm
@@ -292,7 +306,7 @@ async function fileToGenerativePart(file: File): Promise<Part> {
 }
 
 /**
- * Transcribes audio using Gemini 3.8 Flash.
+ * Transcribes audio using Gemini 4 Hydrogen (with automatic fallback to Gemini 3.8 Flash).
  * Supports streaming updates via onChunk callback and falls back gracefully.
  */
 export async function transcribeAudioWithGemini(
@@ -312,14 +326,16 @@ export async function transcribeAudioWithGemini(
     const textPromptPart: Part = { text: promptText };
     const contents = { parts: [audioPart, textPromptPart] };
 
-    console.log(`Sending transcription request to Gemini API with model gemini-3.8-flash (Mode: ${mode})`);
+    let activeModel = PRIMARY_GEMINI_MODEL;
+    console.log(`Sending transcription request to Gemini API with model ${activeModel} (Mode: ${mode})`);
 
     let accumulatedText = "";
     let streamSucceeded = false;
 
-    try {
+    const runStreamWithModel = async (model: string) => {
+      accumulatedText = "";
       const responseStream = await client.models.generateContentStream({
-        model: 'gemini-3.8-flash',
+        model,
         contents,
       });
 
@@ -334,18 +350,47 @@ export async function transcribeAudioWithGemini(
         }
       }
       streamSucceeded = true;
+    };
+
+    try {
+      await runStreamWithModel(activeModel);
     } catch (streamError) {
-      console.warn("Streaming transcription encountered an issue, falling back to direct generateContent:", streamError);
-      // Reset text so we don't end up with partial/corrupt transcription
-      accumulatedText = "";
+      if (isModelUnavailableError(streamError) && activeModel === PRIMARY_GEMINI_MODEL) {
+        console.warn(`Primary model ${activeModel} unavailable, falling back to ${FALLBACK_GEMINI_MODEL}:`, streamError);
+        activeModel = FALLBACK_GEMINI_MODEL;
+        try {
+          await runStreamWithModel(activeModel);
+        } catch (fallbackStreamError) {
+          console.warn(`Streaming transcription on fallback ${activeModel} encountered an issue, falling back to direct generateContent:`, fallbackStreamError);
+          accumulatedText = "";
+        }
+      } else {
+        console.warn("Streaming transcription encountered an issue, falling back to direct generateContent:", streamError);
+        // Reset text so we don't end up with partial/corrupt transcription
+        accumulatedText = "";
+      }
     }
 
     if (!streamSucceeded || !accumulatedText.trim()) {
-      const directResponse = await client.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents,
-      });
-      accumulatedText = directResponse.text || "";
+      try {
+        const directResponse = await client.models.generateContent({
+          model: activeModel,
+          contents,
+        });
+        accumulatedText = directResponse.text || "";
+      } catch (directError) {
+        if (isModelUnavailableError(directError) && activeModel === PRIMARY_GEMINI_MODEL) {
+          console.warn(`Primary model ${activeModel} unavailable for generateContent, retrying with ${FALLBACK_GEMINI_MODEL}:`, directError);
+          activeModel = FALLBACK_GEMINI_MODEL;
+          const fallbackResponse = await client.models.generateContent({
+            model: activeModel,
+            contents,
+          });
+          accumulatedText = fallbackResponse.text || "";
+        } else {
+          throw directError;
+        }
+      }
     }
 
     // Strip markdown code fences if model enclosed output in ```srt or ```text
@@ -421,33 +466,49 @@ export async function analyzeAudioContent(
     const cleanText = extractCleanTextForAnalysis(transcriptionText);
     const analysisPrompt = PROMPTS.analysis(cleanText);
 
-    console.log("Sending analysis request to Gemini API with model gemini-3.8-flash");
+    console.log(`Sending analysis request to Gemini API with model ${PRIMARY_GEMINI_MODEL}`);
 
-    const response: GenerateContentResponse = await client.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: analysisPrompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            summary: {
-              type: Type.STRING,
-              description: 'A concise summary of the content (2-3 sentences).',
-            },
-            cefrLevel: {
-              type: Type.STRING,
-              description: 'An estimated CEFR level (e.g., A1, A2, B1, B2, C1, C2) based on language complexity, vocabulary, and grammar.',
-            },
-            cefrExplanation: {
-              type: Type.STRING,
-              description: 'A 1-2 sentence rationale explaining why this CEFR level was chosen.',
-            },
+    const analysisConfig = {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          summary: {
+            type: Type.STRING,
+            description: 'A concise summary of the content (2-3 sentences).',
           },
-          required: ["summary", "cefrLevel"],
+          cefrLevel: {
+            type: Type.STRING,
+            description: 'An estimated CEFR level (e.g., A1, A2, B1, B2, C1, C2) based on language complexity, vocabulary, and grammar.',
+          },
+          cefrExplanation: {
+            type: Type.STRING,
+            description: 'A 1-2 sentence rationale explaining why this CEFR level was chosen.',
+          },
         },
+        required: ["summary", "cefrLevel"],
       },
-    });
+    };
+
+    let response: GenerateContentResponse;
+    try {
+      response = await client.models.generateContent({
+        model: PRIMARY_GEMINI_MODEL,
+        contents: analysisPrompt,
+        config: analysisConfig,
+      });
+    } catch (analysisModelError) {
+      if (isModelUnavailableError(analysisModelError)) {
+        console.warn(`Primary model ${PRIMARY_GEMINI_MODEL} unavailable for analysis, falling back to ${FALLBACK_GEMINI_MODEL}:`, analysisModelError);
+        response = await client.models.generateContent({
+          model: FALLBACK_GEMINI_MODEL,
+          contents: analysisPrompt,
+          config: analysisConfig,
+        });
+      } else {
+        throw analysisModelError;
+      }
+    }
 
     const rawText = (response.text || "").trim();
     // Clean potential markdown wrap

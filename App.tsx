@@ -330,7 +330,7 @@ const App: React.FC = () => {
       <footer className="text-center py-6 mt-auto text-slate-500 text-xs">
         <p>
           <strong className="font-bold text-sky-400">Voice</strong>
-          <strong className="font-bold text-amber-400">Script</strong> — Audio Transcription &amp; CEFR Intelligence powered by Gemini 3.8 &copy; {new Date().getFullYear()} · <strong className="font-semibold text-slate-400">Made by Shanliang</strong>
+          <strong className="font-bold text-amber-400">Script</strong> — Audio Transcription &amp; CEFR Intelligence powered by Gemini 4 Hydrogen &copy; {new Date().getFullYear()} · <strong className="font-semibold text-slate-400">Made by Shanliang</strong>
         </p>
       </footer>
     </div>

@@ -31,7 +31,7 @@ export const Header: React.FC<HeaderProps> = ({
               </h1>
               <span className="hidden md:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-sky-500/10 text-sky-300 border border-sky-500/20">
                 <Sparkles size={11} className="text-sky-400" />
-                Gemini 3.8
+                Gemini 4 Hydrogen
               </span>
             </div>
             <p className="text-[11px] text-slate-400 hidden sm:block mt-0.5">

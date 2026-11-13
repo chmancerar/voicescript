@@ -1,6 +1,6 @@
 # VoiceScript 🎙️✨
 
-**VoiceScript** is a modern, responsive web application for multimodal audio transcription and linguistic analysis powered by **Google Gemini 3.8 Flash**.
+**VoiceScript** is a modern, responsive web application for multimodal audio transcription and linguistic analysis powered by **Google Gemini 4 Hydrogen**.
 
 ---
 
@@ -75,7 +75,7 @@
 * **Framework:** React 19
 * **Build Tool:** Vite 6
 * **Styling:** Tailwind CSS v4
-* **AI Model:** Google Gemini 3.8 Flash (`@google/genai` SDK)
+* **AI Model:** Google Gemini 4 Hydrogen (`@google/genai` SDK)
 * **Animation:** Motion (v12)
 * **Icons:** Lucide React
 

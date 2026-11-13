@@ -29,7 +29,7 @@ export const ApiKeyWarning: React.FC<ApiKeyWarningProps> = ({ onSaveKey }) => {
       </h3>
 
       <p className="text-sm text-slate-300 max-w-lg mb-4 leading-relaxed">
-        VoiceScript uses Google Gemini 3.8 to transcribe audio and evaluate language proficiency.
+        VoiceScript uses Google Gemini 4 Hydrogen to transcribe audio and evaluate language proficiency.
         Enter your Gemini API key below to start using the app, or set <code className="bg-slate-800 text-yellow-300 px-1.5 py-0.5 rounded font-mono text-xs">GEMINI_API_KEY</code> in your <code className="bg-slate-800 text-yellow-300 px-1.5 py-0.5 rounded font-mono text-xs">.env</code> file.
       </p>
 
